@@ -22,8 +22,15 @@ import subprocess
 import sys
 import tkinter as tk
 import tkinter.font as tkfont
+import webbrowser
 from tkinter import filedialog, messagebox, ttk
 from typing import Optional
+
+try:
+    from _version import VERSION, BUILD_DATE
+except ImportError:
+    VERSION    = "1.0"
+    BUILD_DATE = None
 
 try:
     import fitz  # PyMuPDF
@@ -352,6 +359,77 @@ class _PrintDialog(tk.Toplevel):
 
 
 # ---------------------------------------------------------------------------
+# About dialog
+# ---------------------------------------------------------------------------
+
+class _AboutDialog(tk.Toplevel):
+    """Modal 'About' dialog showing version, build date, repo, and author info."""
+
+    _GITHUB_URL  = "https://github.com/FlorianBock/helper_pdf-editor"
+    _AUTHOR_NAME  = "Florian Bock"
+    _AUTHOR_EMAIL = "florian.bock.mobile@googlemail.com"
+
+    def __init__(self, parent: tk.Tk) -> None:
+        super().__init__(parent)
+        self.title("About Helper: PDF Editor")
+        self.resizable(False, False)
+        self.grab_set()
+
+        pad = dict(padx=16, pady=6)
+
+        # ── App name ──────────────────────────────────────────────────────
+        tk.Label(self, text="Helper: PDF Editor",
+                 font=("Arial", 14, "bold")).pack(padx=16, pady=(16, 2))
+
+        # ── Version / build date ──────────────────────────────────────────
+        if BUILD_DATE:
+            ver_text = f"Version {VERSION}   ·   Built {BUILD_DATE}"
+        else:
+            ver_text = f"Version {VERSION}   ·   (running from source)"
+        tk.Label(self, text=ver_text, fg="#444").pack(padx=16, pady=(0, 10))
+
+        ttk.Separator(self, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=16)
+
+        # ── GitHub repo ───────────────────────────────────────────────────
+        repo_frame = tk.Frame(self)
+        repo_frame.pack(**pad)
+        tk.Label(repo_frame, text="GitHub:", width=9,
+                 anchor=tk.E, fg="#444").pack(side=tk.LEFT)
+        repo_link = tk.Label(repo_frame, text=self._GITHUB_URL,
+                             fg="#0066cc", cursor="hand2", font=("Arial", 9, "underline"))
+        repo_link.pack(side=tk.LEFT, padx=(4, 0))
+        repo_link.bind("<Button-1>",
+                       lambda _e: webbrowser.open(self._GITHUB_URL))
+
+        # ── Author ────────────────────────────────────────────────────────
+        auth_frame = tk.Frame(self)
+        auth_frame.pack(padx=16, pady=(2, 6))
+        tk.Label(auth_frame, text="Author:", width=9,
+                 anchor=tk.E, fg="#444").pack(side=tk.LEFT)
+        tk.Label(auth_frame, text=f"{self._AUTHOR_NAME}  ",
+                 fg="#222").pack(side=tk.LEFT)
+        mail_link = tk.Label(auth_frame, text=self._AUTHOR_EMAIL,
+                             fg="#0066cc", cursor="hand2", font=("Arial", 9, "underline"))
+        mail_link.pack(side=tk.LEFT)
+        mail_link.bind("<Button-1>",
+                       lambda _e: webbrowser.open(f"mailto:{self._AUTHOR_EMAIL}"))
+
+        ttk.Separator(self, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=16, pady=(6, 0))
+
+        # ── Close button ──────────────────────────────────────────────────
+        ttk.Button(self, text="Close", command=self.destroy,
+                   width=10).pack(pady=12)
+
+        self.transient(parent)
+        self.update_idletasks()
+        px = parent.winfo_rootx() + (parent.winfo_width()  - self.winfo_width())  // 2
+        py = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_height()) // 2
+        self.geometry(f"+{px}+{py}")
+        self.bind("<Escape>", lambda _e: self.destroy())
+        self.bind("<Return>", lambda _e: self.destroy())
+
+
+# ---------------------------------------------------------------------------
 # Main application
 # ---------------------------------------------------------------------------
 
@@ -459,6 +537,8 @@ class PDFFormFiller(tk.Tk):
         tk.Button(bar, text="Save PDF…", command=self._save_pdf, width=10).pack(side=tk.LEFT, padx=2)
         tk.Button(bar, text="Print…", command=self._print_pdf, width=8).pack(side=tk.LEFT, padx=2)
         tk.Button(bar, text="↩ Undo", command=self._undo, width=7).pack(side=tk.LEFT, padx=2)
+        _sep(bar)
+        tk.Button(bar, text="About", command=self._show_about, width=6).pack(side=tk.LEFT, padx=2)
         _sep(bar)
 
         # --- Navigation ---
@@ -1703,6 +1783,11 @@ class PDFFormFiller(tk.Tk):
         if self._doc:
             self._flush_page()
             self._render_page()
+
+    def _show_about(self) -> None:
+        """Open the About dialog."""
+        dlg = _AboutDialog(self)
+        self.wait_window(dlg)
 
     def _refresh_controls(self) -> None:
         """Enable or disable navigation/page-op buttons to match the document state."""

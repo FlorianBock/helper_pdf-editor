@@ -20,6 +20,7 @@ A lightweight, standalone Windows desktop application for annotating and editing
 | **Undo** | Ctrl+Z to undo the last placement or eraser |
 | **View** | Continuous-scroll or single-page view, zoom 50 % – 300 % |
 | **Portable** | Build as a single `.exe` with PyInstaller, supports drag-and-drop |
+| **About** | Version, build date, GitHub link, and author info via the About dialog |
 
 ---
 
@@ -123,6 +124,14 @@ Click **Print…** to open the print dialog. Choose a printer, set the page rang
 ### Saving
 
 Click **Save PDF…** to choose an output path. All placed text, check/cross marks, and eraser rectangles are burned permanently into the new file. The original PDF is never modified.
+
+### About
+
+Click **About** in the toolbar to open the About dialog. It shows:
+
+- **Version number** and **build date/time** (the build date is stamped at compile time by `build.ps1`; when running from source it shows "running from source")
+- Clickable **GitHub repository** link — opens your default browser
+- **Author name** and **email** (the email is a `mailto:` link)
 
 ### Undo
 
