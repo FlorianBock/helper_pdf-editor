@@ -1,0 +1,122 @@
+﻿#Requires -Version 5.1
+<#
+.SYNOPSIS
+    Build a standalone single-file executable for helper_pdf-editor.py using PyInstaller.
+
+.DESCRIPTION
+    1. Creates (or reuses) a virtual environment in .\venv
+    2. Installs / upgrades pip, PyInstaller, and all project dependencies
+    3. Runs PyInstaller to produce a single-file, windowed executable
+    4. Copies the result next to this script for easy access
+
+.OUTPUTS
+    dist\helper_pdf-editor.exe  - PyInstaller output
+    helper_pdf-editor.exe       - copy placed in the project root
+#>
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+$ScriptDir  = Split-Path -Parent $MyInvocation.MyCommand.Path
+$VenvDir    = Join-Path $ScriptDir 'venv'
+$MainScript = Join-Path $ScriptDir 'helper_pdf-editor.py'
+$DistDir    = Join-Path $ScriptDir 'dist'
+$OutputExe  = Join-Path $DistDir  'helper_pdf-editor.exe'
+$FinalExe   = Join-Path $ScriptDir 'helper_pdf-editor.exe'
+
+function Write-Step([string]$msg) {
+    Write-Host ""
+    Write-Host "==> $msg" -ForegroundColor Cyan
+}
+
+# Step 1: Locate Python 3
+Write-Step "Locating Python 3"
+
+$PythonExe = $null
+foreach ($candidate in @('python', 'python3', 'py')) {
+    try {
+        $ver = & $candidate --version 2>&1
+        if ($ver -match 'Python 3\.\d+') {
+            $PythonExe = $candidate
+            Write-Host "  Found: $ver  ($candidate)"
+            break
+        }
+    } catch { }
+}
+
+if (-not $PythonExe) {
+    Write-Error "Python 3 not found on PATH. Install it from https://python.org and re-run."
+    exit 1
+}
+
+# Step 2: Create / reuse virtual environment
+Write-Step "Setting up virtual environment at .\venv"
+
+if (-not (Test-Path $VenvDir)) {
+    Write-Host "  Creating new venv..."
+    & $PythonExe -m venv $VenvDir
+} else {
+    Write-Host "  Reusing existing venv."
+}
+
+$VenvPython = Join-Path $VenvDir 'Scripts\python.exe'
+$VenvPip    = Join-Path $VenvDir 'Scripts\pip.exe'
+
+if (-not (Test-Path $VenvPython)) {
+    Write-Error "Virtual environment creation failed - $VenvPython not found."
+    exit 1
+}
+
+# Step 3: Install / upgrade dependencies
+Write-Step "Installing dependencies (pip, PyInstaller, project requirements)"
+
+& $VenvPython -m pip install --upgrade pip --quiet
+& $VenvPip install --upgrade pyinstaller --quiet
+& $VenvPip install --upgrade -r (Join-Path $ScriptDir 'requirements.txt') --quiet
+
+Write-Host "  Dependencies ready."
+
+# Step 4: Run PyInstaller
+Write-Step "Building standalone executable with PyInstaller"
+
+foreach ($dir in @('build', 'dist', '__pycache__')) {
+    $target = Join-Path $ScriptDir $dir
+    if (Test-Path $target) {
+        Write-Host "  Removing old $dir\ ..."
+        Remove-Item $target -Recurse -Force
+    }
+}
+
+$specFile = Join-Path $ScriptDir 'helper_pdf-editor.spec'
+if (Test-Path $specFile) {
+    Remove-Item $specFile -Force
+}
+
+$PyInstaller = Join-Path $VenvDir 'Scripts\pyinstaller.exe'
+
+& $PyInstaller `
+    --onefile `
+    --windowed `
+    --name helper_pdf-editor `
+    --collect-all fitz `
+    --clean `
+    $MainScript
+
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "PyInstaller failed with exit code $LASTEXITCODE."
+    exit $LASTEXITCODE
+}
+
+# Step 5: Copy executable to project root
+Write-Step "Copying executable to project root"
+
+if (Test-Path $OutputExe) {
+    Copy-Item $OutputExe $FinalExe -Force
+    $size = [math]::Round((Get-Item $FinalExe).Length / 1MB, 1)
+    Write-Host ""
+    Write-Host "  Build successful!" -ForegroundColor Green
+    Write-Host "  Output : $FinalExe  ($size MB)" -ForegroundColor Green
+} else {
+    Write-Error "Expected output not found at $OutputExe"
+    exit 1
+}
