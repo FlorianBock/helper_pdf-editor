@@ -71,9 +71,37 @@ class TextPlacement:
 
 @dataclasses.dataclass
 class EraserRect:
-    """A white filled rectangle burned over a region to erase content."""
+    """A white filled rectangle (or oval/polygon) burned over a region to erase content."""
     page_idx: int
     x0: float; y0: float; x1: float; y1: float
+    kind: str = "rect"         # "rect" | "circle" | "lasso" | "free"
+    points: list = dataclasses.field(default_factory=list)  # PDF-space points for lasso/free
+    pencil_size: float = 10.0  # stroke width in PDF points (free mode only)
+
+
+@dataclasses.dataclass
+class ShapeRect:
+    """A geometric shape drawn on a PDF page (rect, rounded_rect, ellipse, line, arrow)."""
+    page_idx: int
+    x0: float; y0: float; x1: float; y1: float   # PDF-space bounding box
+    kind: str = "rect"          # "rect" | "rounded_rect" | "ellipse" | "line" | "arrow"
+    stroke_color: tuple = (0.0, 0.0, 0.0)         # RGB 0-1
+    fill_color: tuple | None = None               # None = no fill
+    line_width: float = 1.5
+    # Runtime: canvas item id for the preview overlay
+    canvas_id: int = 0
+
+
+@dataclasses.dataclass
+class RegionClip:
+    """A raster copy of a page region that can be pasted back as an image."""
+    page_idx: int
+    x_pdf: float; y_pdf: float          # paste destination (PDF-space top-left)
+    w_pdf: float; h_pdf: float          # dimensions in PDF units
+    image: object = dataclasses.field(repr=False, default=None)   # PIL.Image
+    # Runtime
+    canvas_win_id: int = 0
+    frame: object = dataclasses.field(repr=False, default=None)   # tk.Frame
 
 
 def _field_is_checked(value: str) -> bool:
@@ -90,6 +118,13 @@ def _sep(parent: tk.Widget) -> None:
 
 _gdi32    = ctypes.windll.gdi32
 _winspool = ctypes.WinDLL("winspool.drv")
+
+try:
+    from tkinterdnd2 import DND_FILES as _DND_FILES, TkinterDnD as _TkinterDnD
+    _AppBase = _TkinterDnD.Tk
+except ImportError:
+    _AppBase = tk.Tk
+    _DND_FILES = None
 
 # GDI GetDeviceCaps indices
 _HORZRES    = 8
@@ -433,7 +468,7 @@ class _AboutDialog(tk.Toplevel):
 # Main application
 # ---------------------------------------------------------------------------
 
-class PDFFormFiller(tk.Tk):
+class PDFFormFiller(_AppBase):
 
     _ZOOM_OPTIONS = ["50%", "75%", "100%", "125%", "150%", "175%", "200%", "250%", "300%"]
     _DEFAULT_ZOOM = "150%"
@@ -470,21 +505,54 @@ class PDFFormFiller(tk.Tk):
         self._grip_w_cache: int = 0        # lazily measured grip pixel width
         self._right_ctrl_w_cache: int = 0   # lazily measured right-side controls width
 
-        # Undo stack — each entry is either a TextPlacement or an EraserRect
-        self._undo_stack: list[TextPlacement | EraserRect] = []
+        # Undo stack — each entry is either a TextPlacement, EraserRect, ShapeRect, or RegionClip
+        self._undo_stack: list[TextPlacement | EraserRect | ShapeRect | RegionClip] = []
 
         # Eraser rectangles (white boxes painted over content)
         self._erasers: list[EraserRect] = []
 
+        # Shapes drawn on pages
+        self._shapes: list[ShapeRect] = []
+
+        # Pasted region clips
+        self._clips: list[RegionClip] = []
+
+        # Clipboard: the most-recently copied region (PIL Image + PDF-unit size)
+        self._clipboard_image: object = None   # PIL.Image or None
+        self._clipboard_size_pdf: tuple[float, float] = (0.0, 0.0)  # (w_pdf, h_pdf)
+
         # Continuous scroll state (canvas item ids for page images, keyed by page index)
         self._page_offsets: dict[int, tuple[int, int]] = {}  # page_idx -> (cx, cy)
+
+        # Eraser sub-mode
+        self._eraser_kind_var = tk.StringVar(value="rect")
+        self._eraser_pencil_size_var = tk.IntVar(value=10)
 
         # Eraser drag state
         self._eraser_start: tuple[float, float] | None = None
         self._eraser_rect_id: int = 0
+        self._eraser_lasso_points: list[tuple[float, float]] = []   # lasso/free polyline
+
+        # Shape drag state
+        self._shape_start: tuple[float, float] | None = None
+        self._shape_preview_id: int = 0
+
+        # Copy-region drag state
+        self._copy_start: tuple[float, float] | None = None
+        self._copy_preview_id: int = 0
+
+        # Clip drag state (moving a pasted clipboard image)
+        self._clip_drag_data: dict = {}
 
         # Placement mode (set before _build_ui so toolbar can bind to it)
         self._mode_var = tk.StringVar(value="text")
+
+        # Shape style vars (populated in _build_shape_toolbar)
+        self._shape_kind_var    = tk.StringVar(value="rect")
+        self._shape_stroke_var  = tk.StringVar(value="#000000")
+        self._shape_fill_var    = tk.StringVar(value="")        # "" = no fill
+        self._shape_lw_var      = tk.StringVar(value="1.5")
+        self._shape_filled_var  = tk.BooleanVar(value=False)    # fill checkbox
 
         # Continuous scroll mode
         self._continuous_var = tk.BooleanVar(value=True)
@@ -495,6 +563,8 @@ class PDFFormFiller(tk.Tk):
         self._photo_images: list[ImageTk.PhotoImage] = []
 
         self._build_ui()
+        self._mode_var.trace_add("write", self._on_mode_change)
+        self._setup_drop_target()
         self.bind_all("<Control-z>", lambda _e: self._undo())
         self.bind_all("<Control-Z>", lambda _e: self._undo())
         self._refresh_controls()
@@ -508,6 +578,8 @@ class PDFFormFiller(tk.Tk):
         self._build_toolbar()          # row 1 – file, navigation, zoom
         self._build_page_toolbar()     # row 2 – page-level operations
         self._build_editing_toolbar()  # row 3 – text/mark editing controls
+        self._build_eraser_toolbar()   # row 4 – eraser sub-mode controls (hidden by default)
+        self._build_shape_toolbar()    # row 5 – shape style controls (hidden by default)
         self._build_canvas_area()      # main scrollable PDF canvas
         self._build_statusbar()        # bottom status line
 
@@ -663,6 +735,18 @@ class PDFFormFiller(tk.Tk):
                        indicatoron=True).pack(side=tk.LEFT, padx=2)
         _sep(bar)
 
+        # --- Shape draw mode ---
+        tk.Radiobutton(bar, text="⬛ Shape", variable=self._mode_var, value="shape",
+                       indicatoron=True).pack(side=tk.LEFT, padx=2)
+        _sep(bar)
+
+        # --- Copy region / Paste modes ---
+        tk.Radiobutton(bar, text="⧉ Copy region", variable=self._mode_var, value="copy_region",
+                       indicatoron=True).pack(side=tk.LEFT, padx=2)
+        tk.Radiobutton(bar, text="📋 Paste", variable=self._mode_var, value="paste",
+                       indicatoron=True).pack(side=tk.LEFT, padx=2)
+        _sep(bar)
+
         # --- Continuous-scroll toggle ---
         tk.Checkbutton(bar, text="Continuous scroll", variable=self._continuous_var,
                        command=self._on_continuous_toggle).pack(side=tk.LEFT, padx=4)
@@ -670,13 +754,157 @@ class PDFFormFiller(tk.Tk):
 
         # --- Quick-reference hint label ---
         tk.Label(bar,
-                 text="Click to add  •  Drag ⠿ to move  •  × to delete  •  Drag to erase",
+                 text="Click to add  •  Drag ⠿ to move  •  × to delete  •  Drag to erase/draw",
                  fg="#555", font=("Arial", 8, "italic")).pack(side=tk.LEFT, padx=6)
+
+    def _build_eraser_toolbar(self) -> None:
+        """Build the eraser sub-mode toolbar (hidden until eraser mode is active)."""
+        outer = tk.Frame(self, bd=1, relief=tk.RAISED)
+        # Do NOT pack yet — shown/hidden by _on_mode_change
+        self._eraser_toolbar_outer = outer
+
+        tb_canvas = tk.Canvas(outer, height=36, highlightthickness=0, bd=0)
+        h_scroll = ttk.Scrollbar(outer, orient=tk.HORIZONTAL, command=tb_canvas.xview)
+        tb_canvas.configure(xscrollcommand=h_scroll.set)
+        h_scroll.pack(side=tk.BOTTOM, fill=tk.X)
+        tb_canvas.pack(side=tk.TOP, fill=tk.X, expand=True)
+
+        bar = tk.Frame(tb_canvas, padx=4, pady=3)
+        tb_canvas.create_window(0, 0, anchor=tk.NW, window=bar)
+
+        def _on_bar_configure(event):
+            tb_canvas.configure(scrollregion=tb_canvas.bbox("all"),
+                                height=bar.winfo_reqheight())
+        bar.bind("<Configure>", _on_bar_configure)
+
+        tk.Label(bar, text="Eraser:", font=("Arial", 8, "bold")).pack(side=tk.LEFT, padx=(2, 4))
+
+        for label, val in (("⬜ Rectangle", "rect"), ("⭕ Circle", "circle"),
+                           ("⚓ Lasso", "lasso"), ("✏ Free", "free")):
+            tk.Radiobutton(bar, text=label, variable=self._eraser_kind_var, value=val,
+                           indicatoron=True).pack(side=tk.LEFT, padx=2)
+
+        _sep(bar)
+
+        tk.Label(bar, text="Pencil size:").pack(side=tk.LEFT)
+        self._pencil_size_spin = tk.Spinbox(
+            bar, from_=1, to=200, increment=1,
+            textvariable=self._eraser_pencil_size_var, width=4)
+        self._pencil_size_spin.pack(side=tk.LEFT, padx=2)
+        tk.Label(bar, text="px", fg="#555").pack(side=tk.LEFT)
+
+        def _update_pencil_spin(*_):
+            state = tk.NORMAL if self._eraser_kind_var.get() == "free" else tk.DISABLED
+            self._pencil_size_spin.config(state=state)
+        self._eraser_kind_var.trace_add("write", _update_pencil_spin)
+        _update_pencil_spin()  # apply initial state
+
+    def _build_shape_toolbar(self) -> None:
+        """Build the shape style toolbar (hidden until shape mode is active): kind, stroke colour, fill, line width."""
+        outer = tk.Frame(self, bd=1, relief=tk.RAISED)
+        # Do NOT pack yet — shown/hidden by _on_mode_change
+        self._shape_toolbar_outer = outer
+
+        tb_canvas = tk.Canvas(outer, height=36, highlightthickness=0, bd=0)
+        h_scroll = ttk.Scrollbar(outer, orient=tk.HORIZONTAL, command=tb_canvas.xview)
+        tb_canvas.configure(xscrollcommand=h_scroll.set)
+        h_scroll.pack(side=tk.BOTTOM, fill=tk.X)
+        tb_canvas.pack(side=tk.TOP, fill=tk.X, expand=True)
+
+        bar = tk.Frame(tb_canvas, padx=4, pady=3)
+        tb_canvas.create_window(0, 0, anchor=tk.NW, window=bar)
+
+        def _on_bar_configure(event):
+            tb_canvas.configure(scrollregion=tb_canvas.bbox("all"),
+                                height=bar.winfo_reqheight())
+        bar.bind("<Configure>", _on_bar_configure)
+
+        tk.Label(bar, text="Shape:", font=("Arial", 8, "bold")).pack(side=tk.LEFT, padx=(2, 4))
+
+        # Shape kind
+        for label, val in (("Rectangle", "rect"), ("Rounded rect", "rounded_rect"),
+                           ("Ellipse", "ellipse"), ("Line", "line"), ("Arrow", "arrow")):
+            tk.Radiobutton(bar, text=label, variable=self._shape_kind_var, value=val,
+                           indicatoron=True).pack(side=tk.LEFT, padx=2)
+        _sep(bar)
+
+        # Stroke colour swatch
+        tk.Label(bar, text="Stroke:").pack(side=tk.LEFT)
+        self._stroke_swatch = tk.Label(bar, bg=self._shape_stroke_var.get(),
+                                       width=3, relief=tk.SUNKEN, cursor="hand2")
+        self._stroke_swatch.pack(side=tk.LEFT, padx=2)
+        self._stroke_swatch.bind("<Button-1>", lambda _e: self._pick_color("stroke"))
+
+        _sep(bar)
+
+        # Fill toggle + colour swatch
+        tk.Checkbutton(bar, text="Fill", variable=self._shape_filled_var,
+                       command=self._on_fill_toggle).pack(side=tk.LEFT)
+        self._fill_swatch = tk.Label(bar, bg="#ffffff" if not self._shape_filled_var.get() else self._shape_fill_var.get() or "#ffffff",
+                                     width=3, relief=tk.SUNKEN, cursor="hand2")
+        self._fill_swatch.pack(side=tk.LEFT, padx=2)
+        self._fill_swatch.bind("<Button-1>", lambda _e: self._pick_color("fill"))
+
+        _sep(bar)
+
+        # Line width
+        tk.Label(bar, text="Width:").pack(side=tk.LEFT)
+        tk.Spinbox(bar, from_=0.5, to=20.0, increment=0.5,
+                   textvariable=self._shape_lw_var, width=4,
+                   format="%.1f").pack(side=tk.LEFT, padx=2)
+
+    def _pick_color(self, target: str) -> None:
+        """Open the Tk colour chooser and apply the result to stroke or fill."""
+        from tkinter import colorchooser
+        initial = self._shape_stroke_var.get() if target == "stroke" else (self._shape_fill_var.get() or "#ffffff")
+        _, hexcol = colorchooser.askcolor(color=initial, title=f"Choose {target} colour", parent=self)
+        if hexcol:
+            if target == "stroke":
+                self._shape_stroke_var.set(hexcol)
+                self._stroke_swatch.config(bg=hexcol)
+            else:
+                self._shape_fill_var.set(hexcol)
+                self._fill_swatch.config(bg=hexcol)
+
+    def _on_fill_toggle(self) -> None:
+        """Grey-out fill swatch when fill is disabled."""
+        if self._shape_filled_var.get():
+            col = self._shape_fill_var.get() or "#ffffff"
+            self._fill_swatch.config(bg=col)
+        else:
+            self._fill_swatch.config(bg="#d9d9d9")
+
+    def _on_mode_change(self, *_) -> None:
+        """Show/hide the eraser and shape sub-toolbars based on the active mode."""
+        mode = self._mode_var.get()
+        if mode == "eraser":
+            self._eraser_toolbar_outer.pack(side=tk.TOP, fill=tk.X,
+                                            before=self._canvas_area_outer)
+            self._shape_toolbar_outer.pack_forget()
+        elif mode == "shape":
+            self._shape_toolbar_outer.pack(side=tk.TOP, fill=tk.X,
+                                           before=self._canvas_area_outer)
+            self._eraser_toolbar_outer.pack_forget()
+        else:
+            self._eraser_toolbar_outer.pack_forget()
+            self._shape_toolbar_outer.pack_forget()
+
+    @staticmethod
+    def _hex_to_rgb(hex_color: str) -> tuple[float, float, float]:
+        """Convert '#rrggbb' to a (r, g, b) tuple with values 0.0–1.0."""
+        h = hex_color.lstrip("#")
+        if len(h) == 3:
+            h = h[0]*2 + h[1]*2 + h[2]*2
+        r = int(h[0:2], 16) / 255.0
+        g = int(h[2:4], 16) / 255.0
+        b = int(h[4:6], 16) / 255.0
+        return (r, g, b)
 
     def _build_canvas_area(self) -> None:
         """Build the main PDF canvas with horizontal and vertical scrollbars."""
         outer = tk.Frame(self)
         outer.pack(fill=tk.BOTH, expand=True)
+        self._canvas_area_outer = outer
 
         self._canvas = tk.Canvas(outer, bg="#606060", cursor="crosshair", highlightthickness=0)
         vs = ttk.Scrollbar(outer, orient=tk.VERTICAL, command=self._canvas.yview)
@@ -717,7 +945,70 @@ class PDFFormFiller(tk.Tk):
             filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")],
         )
         if path:
-            self._load_pdf(path)
+            self._open_dropped_pdf(path)
+
+    def _has_unsaved_changes(self) -> bool:
+        """Return True if there are any annotations/edits not yet saved to disk."""
+        return bool(self._doc and (
+            self._placements or self._erasers or self._shapes or self._clips))
+
+    def _open_dropped_pdf(self, path: str) -> None:
+        """Open *path*, asking about unsaved changes first if a document is already loaded."""
+        if self._has_unsaved_changes():
+            answer = messagebox.askyesnocancel(
+                "Unsaved Changes",
+                f"The current document has unsaved changes.\n\n"
+                f"Save before opening '{os.path.basename(path)}'?",
+                parent=self,
+            )
+            if answer is None:   # Cancel — abort
+                return
+            if answer:           # Yes — save first
+                self._save_pdf()
+        self._load_pdf(path)
+
+    def _setup_drop_target(self) -> None:
+        """Register the window and all child widgets to accept drag-and-drop PDF files via tkinterdnd2."""
+        if _DND_FILES is None:
+            return  # tkinterdnd2 not installed — drag-and-drop unavailable
+        # Defer until the first idle cycle so every widget has a real HWND
+        # (Tk only assigns Win32 window handles once it renders the widget tree;
+        # calling drop_target_register before that silently does nothing).
+        self.after_idle(self._do_register_drop_targets)
+
+    def _do_register_drop_targets(self) -> None:
+        """Actually register all widgets; called one idle cycle after startup."""
+        self.update_idletasks()   # ensure all widgets are realised
+        self._register_drop_recursive(self)
+
+    def _register_drop_recursive(self, widget) -> None:
+        """Register *widget* and all its descendants as drop targets for PDF files."""
+        if _DND_FILES is None:
+            return
+        try:
+            widget.drop_target_register(_DND_FILES)
+            widget.dnd_bind("<<Drop>>", self._on_file_drop)
+        except Exception:
+            pass
+        for child in widget.winfo_children():
+            self._register_drop_recursive(child)
+
+    def _on_file_drop(self, event) -> None:
+        """Handle a file-drop event from tkinterdnd2."""
+        raw = event.data.strip()
+        # tkinterdnd2 wraps paths that contain spaces in curly braces, and
+        # may deliver multiple files as '{path1} {path2}' — pick the first PDF.
+        import re as _re
+        if raw.startswith("{"):
+            candidates = _re.findall(r"\{([^}]+)\}", raw)
+            if not candidates:
+                candidates = [raw[1:-1]]
+        else:
+            candidates = raw.split()
+        for p in candidates:
+            if p.lower().endswith(".pdf") and os.path.isfile(p):
+                self.after(0, lambda path=p: self._open_dropped_pdf(path))
+                break
 
     def _load_pdf(self, path: str) -> None:
         """Open *path* and replace the current document with it.
@@ -740,6 +1031,9 @@ class PDFFormFiller(tk.Tk):
         self._undo_stack.clear()
         self._acro_widgets.clear()
         self._erasers.clear()
+        self._shapes.clear()
+        self._clips.clear()
+        self._clipboard_image = None
         self._page_offsets.clear()
         self._photo_images.clear()
         self.title(f"Helper: PDF Editor — {os.path.basename(path)}")
@@ -897,14 +1191,90 @@ class PDFFormFiller(tk.Tk):
         messagebox.showinfo("Saved", f"PDF saved to:\n{path}")
 
     def _apply_placements_to(self, doc: fitz.Document) -> None:
-        """Burn all free-text/check placements and erasers into *doc* (a copy)."""
-        # First burn white eraser rectangles so they sit beneath new text
+        """Burn all free-text/check placements, erasers, shapes, and clips into *doc* (a copy)."""
+        # First burn white eraser rectangles so they sit beneath new content
         for er in self._erasers:
             page: fitz.Page = doc[er.page_idx]
             shape = page.new_shape()
-            shape.draw_rect(fitz.Rect(er.x0, er.y0, er.x1, er.y1))
-            shape.finish(color=(1, 1, 1), fill=(1, 1, 1), width=0)
+            if er.kind == "circle":
+                shape.draw_oval(fitz.Rect(er.x0, er.y0, er.x1, er.y1))
+                shape.finish(color=(1, 1, 1), fill=(1, 1, 1), width=0)
+            elif er.kind == "lasso" and len(er.points) >= 3:
+                shape.draw_polyline([fitz.Point(p[0], p[1]) for p in er.points])
+                shape.finish(color=(1, 1, 1), fill=(1, 1, 1), width=0, closePath=True)
+            elif er.kind == "free" and len(er.points) >= 2:
+                shape.draw_squiggle([fitz.Point(p[0], p[1]) for p in er.points], curviness=0)
+                shape.finish(color=(1, 1, 1), fill=None, width=er.pencil_size,
+                             closePath=False, lineJoin=1)
+            else:  # rect (default) or degenerate lasso
+                shape.draw_rect(fitz.Rect(er.x0, er.y0, er.x1, er.y1))
+                shape.finish(color=(1, 1, 1), fill=(1, 1, 1), width=0)
             shape.commit()
+
+        # Burn geometric shapes
+        for sh in self._shapes:
+            page: fitz.Page = doc[sh.page_idx]
+            s = page.new_shape()
+            fill = sh.fill_color if sh.fill_color else None
+            lw   = sh.line_width
+            if sh.kind == "rect":
+                s.draw_rect(fitz.Rect(sh.x0, sh.y0, sh.x1, sh.y1))
+                s.finish(color=sh.stroke_color, fill=fill, width=lw)
+            elif sh.kind == "rounded_rect":
+                r = min(abs(sh.x1 - sh.x0), abs(sh.y1 - sh.y0)) * 0.15
+                x0r, y0r, x1r, y1r = sh.x0, sh.y0, sh.x1, sh.y1
+                P = fitz.Point
+                # 8 path segments: 4 straight sides + 4 cubic-bezier corners
+                s.draw_line(P(x0r + r, y0r), P(x1r - r, y0r))          # top
+                s.draw_curve(P(x1r - r, y0r), P(x1r, y0r), P(x1r, y0r + r))  # top-right
+                s.draw_line(P(x1r, y0r + r), P(x1r, y1r - r))          # right
+                s.draw_curve(P(x1r, y1r - r), P(x1r, y1r), P(x1r - r, y1r))  # bottom-right
+                s.draw_line(P(x1r - r, y1r), P(x0r + r, y1r))          # bottom
+                s.draw_curve(P(x0r + r, y1r), P(x0r, y1r), P(x0r, y1r - r))  # bottom-left
+                s.draw_line(P(x0r, y1r - r), P(x0r, y0r + r))          # left
+                s.draw_curve(P(x0r, y0r + r), P(x0r, y0r), P(x0r + r, y0r))  # top-left
+                s.finish(color=sh.stroke_color, fill=fill, width=lw, closePath=True)
+            elif sh.kind == "ellipse":
+                s.draw_oval(fitz.Rect(sh.x0, sh.y0, sh.x1, sh.y1))
+                s.finish(color=sh.stroke_color, fill=fill, width=lw)
+            elif sh.kind == "line":
+                s.draw_line(fitz.Point(sh.x0, sh.y0), fitz.Point(sh.x1, sh.y1))
+                s.finish(color=sh.stroke_color, width=lw, closePath=False)
+            elif sh.kind == "arrow":
+                # Draw line + filled arrowhead
+                s.draw_line(fitz.Point(sh.x0, sh.y0), fitz.Point(sh.x1, sh.y1))
+                s.finish(color=sh.stroke_color, width=lw, closePath=False)
+                # Arrowhead
+                import math as _math
+                dx = sh.x1 - sh.x0
+                dy = sh.y1 - sh.y0
+                length = _math.hypot(dx, dy) or 1
+                ux, uy = dx / length, dy / length
+                head  = lw * 4
+                wing  = lw * 2.5
+                tip   = fitz.Point(sh.x1, sh.y1)
+                base  = fitz.Point(sh.x1 - ux * head, sh.y1 - uy * head)
+                left  = fitz.Point(base.x + uy * wing, base.y - ux * wing)
+                right = fitz.Point(base.x - uy * wing, base.y + ux * wing)
+                s2 = page.new_shape()
+                s2.draw_polyline([tip, left, right])
+                s2.finish(color=sh.stroke_color, fill=sh.stroke_color,
+                           width=0, closePath=True)
+                s2.commit()
+            s.commit()
+
+        # Burn pasted region clips
+        for clip in self._clips:
+            page: fitz.Page = doc[clip.page_idx]
+            buf = io.BytesIO()
+            clip.image.save(buf, format="PNG")
+            buf.seek(0)
+            rect = fitz.Rect(clip.x_pdf, clip.y_pdf,
+                             clip.x_pdf + clip.w_pdf,
+                             clip.y_pdf + clip.h_pdf)
+            page.insert_image(rect, stream=buf.read())
+
+        # Burn text placements
         errors = []
         for pl in self._placements:
             # Prefer live var value over cached pl.text (belt-and-suspenders)
@@ -924,10 +1294,6 @@ class PDFFormFiller(tk.Tk):
                     )
                     font_path = _find_unicode_font(pl.bold)
                     if font_path:
-                        # Use an embedded TrueType font so any Unicode character
-                        # (e.g. €, ©, accented letters) is preserved correctly.
-                        # A stable fontname lets PyMuPDF reuse the same embedded
-                        # resource across multiple textbox calls on the same page.
                         fn = "UtextBold" if pl.bold else "UtextReg"
                         page.insert_textbox(
                             rect, text,
@@ -936,7 +1302,6 @@ class PDFFormFiller(tk.Tk):
                             color=(0, 0, 0), align=0,
                         )
                     else:
-                        # Fall back to built-in Type1 font (ASCII + Latin-1 only)
                         fontname = "hebo" if pl.bold else "helv"
                         page.insert_textbox(
                             rect, text,
@@ -1013,6 +1378,16 @@ class PDFFormFiller(tk.Tk):
             if pl.page_idx == self._current_page:
                 self._create_text_widget(pl)
 
+        # Restore shape overlays for this page
+        for sh in self._shapes:
+            if sh.page_idx == self._current_page:
+                self._draw_shape_preview(sh, p, p)
+
+        # Restore pasted clip overlays for this page
+        for cl in self._clips:
+            if cl.page_idx == self._current_page:
+                self._create_clip_widget(cl, p, p)
+
     def _render_continuous(self) -> None:
         """Render all pages stacked vertically in a single scrollable canvas."""
         self._destroy_all_overlays()
@@ -1044,6 +1419,16 @@ class PDFFormFiller(tk.Tk):
             for pl in self._placements:
                 if pl.page_idx == pg_idx:
                     self._create_text_widget_at(pl, p, y_cursor)
+
+            # Shape overlays for this page
+            for sh in self._shapes:
+                if sh.page_idx == pg_idx:
+                    self._draw_shape_preview(sh, p, y_cursor)
+
+            # Pasted clip overlays for this page
+            for cl in self._clips:
+                if cl.page_idx == pg_idx:
+                    self._create_clip_widget(cl, p, y_cursor)
 
             y_cursor += pix.height + p  # gap between pages
 
@@ -1136,15 +1521,33 @@ class PDFFormFiller(tk.Tk):
         return None
 
     def _on_canvas_click(self, event: tk.Event) -> None:
-        """Handle a left-click on the canvas: start an eraser drag or place a new item."""
+        """Handle a left-click on the canvas: start an eraser/shape/copy drag or place a new item."""
         if not self._doc:
             return
         cx = self._canvas.canvasx(event.x)
         cy = self._canvas.canvasy(event.y)
 
+        mode = self._mode_var.get()
+
         # Eraser mode: start drag, don't place text
-        if self._mode_var.get() == "eraser":
+        if mode == "eraser":
             self._eraser_start = (cx, cy)
+            self._eraser_lasso_points = [(cx, cy)]
+            return
+
+        # Shape draw mode: start drag
+        if mode == "shape":
+            self._shape_start = (cx, cy)
+            return
+
+        # Copy-region mode: start drag
+        if mode == "copy_region":
+            self._copy_start = (cx, cy)
+            return
+
+        # Paste mode: place clipboard image at click position
+        if mode == "paste":
+            self._paste_at(cx, cy)
             return
 
         # Determine which page was clicked
@@ -1163,7 +1566,6 @@ class PDFFormFiller(tk.Tk):
         except ValueError:
             font_size = self._DEFAULT_FS
 
-        mode = self._mode_var.get()
         if mode == "check_v":
             kind, text = "check", "✓"
         elif mode == "check_x":
@@ -1317,6 +1719,9 @@ class PDFFormFiller(tk.Tk):
                 pass
 
         frame.after(100, _apply_transparency)
+        # Register the new overlay frame (and its children) as a drop target so
+        # dragging a PDF over a text widget still opens it.
+        self._register_drop_recursive(frame)
 
         del_btn.bind("<Button-1>", lambda _e, _pl=pl: self._delete_placement(_pl))
         for widget in (grip, frame):
@@ -1362,7 +1767,7 @@ class PDFFormFiller(tk.Tk):
             pass
 
     def _undo(self) -> None:
-        """Remove the most recently added placement or eraser."""
+        """Remove the most recently added placement, eraser, shape, or clip."""
         if not self._undo_stack:
             return
         item = self._undo_stack.pop()
@@ -1372,7 +1777,6 @@ class PDFFormFiller(tk.Tk):
             except ValueError:
                 pass
             # Remove visual preview rectangle for this eraser (if still on canvas)
-            # We tag erasers by their id; find by matching coords
             ox = oy = self._PAD
             if item.page_idx in self._page_offsets:
                 ox, oy = self._page_offsets[item.page_idx]
@@ -1381,12 +1785,21 @@ class PDFFormFiller(tk.Tk):
             ry0 = item.y0 * z + oy
             rx1 = item.x1 * z + ox
             ry1 = item.y1 * z + oy
-            # Delete any overlapping eraser_preview rectangle
             for cid in self._canvas.find_withtag("eraser_preview"):
                 coords = self._canvas.coords(cid)
                 if coords and abs(coords[0] - rx0) < 2 and abs(coords[1] - ry0) < 2:
                     self._canvas.delete(cid)
                     break
+        elif isinstance(item, ShapeRect):
+            try:
+                self._shapes.remove(item)
+            except ValueError:
+                pass
+            if item.canvas_id:
+                self._canvas.delete(item.canvas_id)
+                item.canvas_id = 0
+        elif isinstance(item, RegionClip):
+            self._delete_clip(item)
         else:
             self._delete_placement(item)
 
@@ -1447,6 +1860,15 @@ class PDFFormFiller(tk.Tk):
                 pl.canvas_win_id = 0
                 pl.var = None
                 pl.entry = None
+        # Reset shape canvas ids (the canvas is cleared, items no longer exist)
+        for sh in self._shapes:
+            sh.canvas_id = 0
+        # Destroy clip overlay frames
+        for cl in self._clips:
+            if cl.frame:
+                cl.frame.destroy()
+                cl.frame = None
+                cl.canvas_win_id = 0
 
     def _destroy_current_overlays(self) -> None:
         """Destroy live tk widgets for the current page before re-rendering."""
@@ -1486,7 +1908,7 @@ class PDFFormFiller(tk.Tk):
                 pass
 
     def _clear_page(self) -> None:
-        """Remove all free-text placements from the current page."""
+        """Remove all free-text placements, shapes, and clips from the current page."""
         for pl in [p for p in self._placements if p.page_idx == self._current_page]:
             if pl.canvas_win_id:
                 self._canvas.delete(pl.canvas_win_id)
@@ -1498,12 +1920,34 @@ class PDFFormFiller(tk.Tk):
                 self._undo_stack.remove(pl)
             except ValueError:
                 pass
-        # Also remove erasers on this page (the white boxes are burned in on save)
+        # Remove erasers on this page
         removed_erasers = [e for e in self._erasers if e.page_idx == self._current_page]
         self._erasers = [e for e in self._erasers if e.page_idx != self._current_page]
         for er in removed_erasers:
             try:
                 self._undo_stack.remove(er)
+            except ValueError:
+                pass
+        # Remove shapes on this page
+        removed_shapes = [s for s in self._shapes if s.page_idx == self._current_page]
+        self._shapes = [s for s in self._shapes if s.page_idx != self._current_page]
+        for sh in removed_shapes:
+            if sh.canvas_id:
+                self._canvas.delete(sh.canvas_id)
+            try:
+                self._undo_stack.remove(sh)
+            except ValueError:
+                pass
+        # Remove pasted clips on this page
+        removed_clips = [c for c in self._clips if c.page_idx == self._current_page]
+        self._clips = [c for c in self._clips if c.page_idx != self._current_page]
+        for cl in removed_clips:
+            if cl.canvas_win_id:
+                self._canvas.delete(cl.canvas_win_id)
+            if cl.frame:
+                cl.frame.destroy()
+            try:
+                self._undo_stack.remove(cl)
             except ValueError:
                 pass
 
@@ -1512,38 +1956,216 @@ class PDFFormFiller(tk.Tk):
     # ------------------------------------------------------------------
 
     def _on_canvas_drag(self, event: tk.Event) -> None:
-        """Draw a dashed rubber-band rectangle while the user drags in eraser mode."""
-        if self._mode_var.get() != "eraser":
-            return
+        """Draw a rubber-band overlay while the user drags in eraser/shape/copy mode."""
+        mode = self._mode_var.get()
         cx = self._canvas.canvasx(event.x)
         cy = self._canvas.canvasy(event.y)
-        if self._eraser_start is None:
-            return
-        x0, y0 = self._eraser_start
-        if self._eraser_rect_id:
-            self._canvas.coords(self._eraser_rect_id, x0, y0, cx, cy)
-        else:
-            self._eraser_rect_id = self._canvas.create_rectangle(
-                x0, y0, cx, cy, outline="#0066cc", width=2, dash=(4, 3))
+
+        if mode == "eraser":
+            if self._eraser_start is None:
+                return
+            x0, y0 = self._eraser_start
+            ekind = self._eraser_kind_var.get()
+            if ekind == "circle":
+                if self._eraser_rect_id:
+                    self._canvas.coords(self._eraser_rect_id, x0, y0, cx, cy)
+                else:
+                    self._eraser_rect_id = self._canvas.create_oval(
+                        x0, y0, cx, cy, outline="#0066cc", width=2, dash=(4, 3))
+            elif ekind in ("lasso", "free"):
+                # Accumulate points for a freehand polygon / stroke
+                self._eraser_lasso_points.append((cx, cy))
+                # Redraw the polyline each motion event
+                self._canvas.delete("eraser_lasso_preview")
+                pts = self._eraser_lasso_points
+                if len(pts) >= 2:
+                    flat = [v for p in pts for v in p]
+                    if ekind == "free":
+                        px_w = max(2, self._eraser_pencil_size_var.get())
+                        self._canvas.create_line(*flat, fill="#99ccff", width=px_w,
+                                                 capstyle=tk.ROUND, joinstyle=tk.ROUND,
+                                                 tags="eraser_lasso_preview")
+                    else:
+                        self._canvas.create_line(*flat, fill="#0066cc", width=2,
+                                                 dash=(4, 3), tags="eraser_lasso_preview")
+            else:  # rect (default)
+                if self._eraser_rect_id:
+                    self._canvas.coords(self._eraser_rect_id, x0, y0, cx, cy)
+                else:
+                    self._eraser_rect_id = self._canvas.create_rectangle(
+                        x0, y0, cx, cy, outline="#0066cc", width=2, dash=(4, 3))
+
+        elif mode == "shape":
+            if self._shape_start is None:
+                return
+            x0, y0 = self._shape_start
+            kind = self._shape_kind_var.get()
+            stroke = self._shape_stroke_var.get()
+            if self._shape_preview_id:
+                self._canvas.coords(self._shape_preview_id, x0, y0, cx, cy)
+            else:
+                if kind == "ellipse":
+                    self._shape_preview_id = self._canvas.create_oval(
+                        x0, y0, cx, cy, outline=stroke, width=2, dash=(4, 3))
+                elif kind in ("line", "arrow"):
+                    self._shape_preview_id = self._canvas.create_line(
+                        x0, y0, cx, cy, fill=stroke, width=2, dash=(4, 3),
+                        arrow=tk.LAST if kind == "arrow" else tk.NONE)
+                else:
+                    self._shape_preview_id = self._canvas.create_rectangle(
+                        x0, y0, cx, cy, outline=stroke, width=2, dash=(4, 3))
+
+        elif mode == "copy_region":
+            if self._copy_start is None:
+                return
+            x0, y0 = self._copy_start
+            if self._copy_preview_id:
+                self._canvas.coords(self._copy_preview_id, x0, y0, cx, cy)
+            else:
+                self._copy_preview_id = self._canvas.create_rectangle(
+                    x0, y0, cx, cy, outline="#ff6600", width=2, dash=(6, 3))
 
     def _on_canvas_release(self, event: tk.Event) -> None:
-        """Finalise an eraser drag: commit the EraserRect and draw a white preview."""
-        if self._mode_var.get() != "eraser" or self._eraser_start is None:
-            return
+        """Finalise an eraser/shape/copy-region drag on mouse-button release."""
+        mode = self._mode_var.get()
         cx = self._canvas.canvasx(event.x)
         cy = self._canvas.canvasy(event.y)
+
+        if mode == "eraser" and self._eraser_start is not None:
+            self._finish_eraser(cx, cy)
+        elif mode == "shape" and self._shape_start is not None:
+            self._finish_shape(cx, cy)
+        elif mode == "copy_region" and self._copy_start is not None:
+            self._finish_copy_region(cx, cy)
+
+    # ------------------------------------------------------------------
+    # Eraser finalise
+    # ------------------------------------------------------------------
+
+    def _finish_eraser(self, cx: float, cy: float) -> None:
+        """Commit the eraser shape (rect, circle, lasso, or free)."""
         x0, y0 = self._eraser_start
         self._eraser_start = None
+        ekind = self._eraser_kind_var.get()
+
+        # Clean up rubber-band / lasso preview
         if self._eraser_rect_id:
             self._canvas.delete(self._eraser_rect_id)
             self._eraser_rect_id = 0
+        self._canvas.delete("eraser_lasso_preview")
+
         z = self._zoom
-        # Convert canvas coords to PDF coords — determine which page the eraser is on
+
+        if ekind in ("lasso", "free"):
+            pts_canvas = self._eraser_lasso_points
+            self._eraser_lasso_points = []
+            min_pts = 2 if ekind == "free" else 3
+            if len(pts_canvas) < min_pts:
+                return
+            # Determine which page contains the centroid of the path
+            xs = [p[0] for p in pts_canvas]
+            ys = [p[1] for p in pts_canvas]
+            min_x, max_x = min(xs), max(xs)
+            min_y, max_y = min(ys), max(ys)
+            mid_x = (min_x + max_x) / 2
+            mid_y = (min_y + max_y) / 2
+            pg_idx = self._current_page
+            for pidx, (ox, oy) in self._page_offsets.items():
+                page_obj = self._doc[pidx]
+                pw = page_obj.rect.width * z
+                ph = page_obj.rect.height * z
+                if ox <= mid_x <= ox + pw and oy <= mid_y <= oy + ph:
+                    pg_idx = pidx
+                    break
+            ox, oy = self._page_offsets.get(pg_idx, (self._PAD, self._PAD))
+            pdf_pts = [((p[0] - ox) / z, (p[1] - oy) / z) for p in pts_canvas]
+            x0_pdf = min(p[0] for p in pdf_pts)
+            y0_pdf = min(p[1] for p in pdf_pts)
+            x1_pdf = max(p[0] for p in pdf_pts)
+            y1_pdf = max(p[1] for p in pdf_pts)
+            if ekind == "free":
+                px_w = max(1, self._eraser_pencil_size_var.get())
+                pencil_pdf = px_w / z
+                er = EraserRect(
+                    page_idx=pg_idx,
+                    x0=x0_pdf, y0=y0_pdf, x1=x1_pdf, y1=y1_pdf,
+                    kind="free",
+                    points=pdf_pts,
+                    pencil_size=pencil_pdf,
+                )
+                self._erasers.append(er)
+                self._undo_stack.append(er)
+                # Canvas preview: thick white round-capped stroke
+                flat = [v for p in pts_canvas for v in p]
+                self._canvas.create_line(*flat, fill="white", width=px_w,
+                                         capstyle=tk.ROUND, joinstyle=tk.ROUND,
+                                         tags="eraser_preview")
+            else:  # lasso
+                er = EraserRect(
+                    page_idx=pg_idx,
+                    x0=x0_pdf, y0=y0_pdf, x1=x1_pdf, y1=y1_pdf,
+                    kind="lasso",
+                    points=pdf_pts,
+                )
+                self._erasers.append(er)
+                self._undo_stack.append(er)
+                # Canvas preview: white filled polygon
+                flat = [v for p in pts_canvas for v in p]
+                self._canvas.create_polygon(*flat, fill="white", outline="",
+                                            tags="eraser_preview")
+            return
+
+        # rect / circle: use bounding box
         rx0, rx1 = sorted([x0, cx])
         ry0, ry1 = sorted([y0, cy])
         if rx1 - rx0 < 4 or ry1 - ry0 < 4:
-            return  # too small, ignore
-        # Find the page whose origin best contains the eraser rect centre
+            return
+        mid_x = (rx0 + rx1) / 2
+        mid_y = (ry0 + ry1) / 2
+        pg_idx = self._current_page
+        for pidx, (ox, oy) in self._page_offsets.items():
+            page_obj = self._doc[pidx]
+            pw = page_obj.rect.width * z
+            ph = page_obj.rect.height * z
+            if ox <= mid_x <= ox + pw and oy <= mid_y <= oy + ph:
+                pg_idx = pidx
+                break
+        ox, oy = self._page_offsets.get(pg_idx, (self._PAD, self._PAD))
+        er = EraserRect(
+            page_idx=pg_idx,
+            x0=(rx0 - ox) / z, y0=(ry0 - oy) / z,
+            x1=(rx1 - ox) / z, y1=(ry1 - oy) / z,
+            kind=ekind,
+        )
+        self._erasers.append(er)
+        self._undo_stack.append(er)
+        if ekind == "circle":
+            self._canvas.create_oval(rx0, ry0, rx1, ry1,
+                                     fill="white", outline="", tags="eraser_preview")
+        else:
+            self._canvas.create_rectangle(rx0, ry0, rx1, ry1,
+                                           fill="white", outline="", tags="eraser_preview")
+
+    # ------------------------------------------------------------------
+    # Shape finalise
+    # ------------------------------------------------------------------
+
+    def _finish_shape(self, cx: float, cy: float) -> None:
+        """Commit the drawn shape."""
+        x0, y0 = self._shape_start
+        self._shape_start = None
+        if self._shape_preview_id:
+            self._canvas.delete(self._shape_preview_id)
+            self._shape_preview_id = 0
+        z = self._zoom
+        rx0, rx1 = sorted([x0, cx])
+        ry0, ry1 = sorted([y0, cy])
+        kind = self._shape_kind_var.get()
+        # For lines/arrows a zero-area rect is fine; otherwise enforce minimum
+        if kind not in ("line", "arrow") and (rx1 - rx0 < 4 or ry1 - ry0 < 4):
+            return
+        if kind in ("line", "arrow") and (abs(cx - x0) < 2 and abs(cy - y0) < 2):
+            return
         mid_x = (rx0 + rx1) / 2
         mid_y = (ry0 + ry1) / 2
         pg_idx = self._current_page
@@ -1555,16 +2177,214 @@ class PDFFormFiller(tk.Tk):
                 pg_idx = pidx
                 break
         ox, oy = self._page_offsets.get(pg_idx, (self._PAD, self._PAD))
-        er = EraserRect(
+        # For line/arrow keep original direction, not sorted
+        if kind in ("line", "arrow"):
+            lx0, ly0, lx1, ly1 = x0, y0, cx, cy
+        else:
+            lx0, ly0, lx1, ly1 = rx0, ry0, rx1, ry1
+        stroke = self._hex_to_rgb(self._shape_stroke_var.get())
+        fill   = self._hex_to_rgb(self._shape_fill_var.get()) if (
+            self._shape_filled_var.get() and self._shape_fill_var.get()) else None
+        try:
+            lw = float(self._shape_lw_var.get())
+        except ValueError:
+            lw = 1.5
+        sh = ShapeRect(
             page_idx=pg_idx,
-            x0=(rx0 - ox) / z, y0=(ry0 - oy) / z,
-            x1=(rx1 - ox) / z, y1=(ry1 - oy) / z,
+            x0=(lx0 - ox) / z, y0=(ly0 - oy) / z,
+            x1=(lx1 - ox) / z, y1=(ly1 - oy) / z,
+            kind=kind,
+            stroke_color=stroke,
+            fill_color=fill,
+            line_width=lw,
         )
-        self._erasers.append(er)
-        self._undo_stack.append(er)
-        # Draw a preview white rectangle on the canvas
-        self._canvas.create_rectangle(rx0, ry0, rx1, ry1,
-                                       fill="white", outline="", tags="eraser_preview")
+        self._shapes.append(sh)
+        self._undo_stack.append(sh)
+        # Draw permanent preview on canvas
+        self._draw_shape_preview(sh, ox, oy)
+
+    def _draw_shape_preview(self, sh: ShapeRect, ox: int, oy: int) -> None:
+        """Draw the canvas preview overlay for a committed ShapeRect."""
+        z = self._zoom
+        sx0 = sh.x0 * z + ox
+        sy0 = sh.y0 * z + oy
+        sx1 = sh.x1 * z + ox
+        sy1 = sh.y1 * z + oy
+
+        def _rgb_to_hex(rgb):
+            return "#{:02x}{:02x}{:02x}".format(
+                int(rgb[0] * 255), int(rgb[1] * 255), int(rgb[2] * 255))
+
+        stroke_hex = _rgb_to_hex(sh.stroke_color)
+        fill_hex   = _rgb_to_hex(sh.fill_color) if sh.fill_color else ""
+        lw_px      = max(1, int(sh.line_width * z / 2))
+
+        if sh.kind == "ellipse":
+            cid = self._canvas.create_oval(
+                sx0, sy0, sx1, sy1,
+                outline=stroke_hex, fill=fill_hex or "", width=lw_px,
+                tags="shape_preview")
+        elif sh.kind == "line":
+            cid = self._canvas.create_line(
+                sx0, sy0, sx1, sy1,
+                fill=stroke_hex, width=lw_px, tags="shape_preview")
+        elif sh.kind == "arrow":
+            cid = self._canvas.create_line(
+                sx0, sy0, sx1, sy1,
+                fill=stroke_hex, width=lw_px,
+                arrow=tk.LAST, arrowshape=(lw_px * 5, lw_px * 6, lw_px * 2),
+                tags="shape_preview")
+        else:
+            # rect and rounded_rect both shown as rectangle on canvas
+            cid = self._canvas.create_rectangle(
+                sx0, sy0, sx1, sy1,
+                outline=stroke_hex, fill=fill_hex or "", width=lw_px,
+                tags="shape_preview")
+        sh.canvas_id = cid
+
+    # ------------------------------------------------------------------
+    # Copy-region finalise
+    # ------------------------------------------------------------------
+
+    def _finish_copy_region(self, cx: float, cy: float) -> None:
+        """Rasterise the selected region from the current page into the clipboard."""
+        x0, y0 = self._copy_start
+        self._copy_start = None
+        if self._copy_preview_id:
+            self._canvas.delete(self._copy_preview_id)
+            self._copy_preview_id = 0
+        z = self._zoom
+        rx0, rx1 = sorted([x0, cx])
+        ry0, ry1 = sorted([y0, cy])
+        if rx1 - rx0 < 8 or ry1 - ry0 < 8:
+            return
+        # Determine page
+        mid_x = (rx0 + rx1) / 2
+        mid_y = (ry0 + ry1) / 2
+        pg_idx = self._current_page
+        for pidx, (ox, oy) in self._page_offsets.items():
+            page = self._doc[pidx]
+            pw = page.rect.width * z
+            ph = page.rect.height * z
+            if ox <= mid_x <= ox + pw and oy <= mid_y <= oy + ph:
+                pg_idx = pidx
+                break
+        ox, oy = self._page_offsets.get(pg_idx, (self._PAD, self._PAD))
+        # PDF-space rect of the selection
+        pdf_x0 = (rx0 - ox) / z
+        pdf_y0 = (ry0 - oy) / z
+        pdf_x1 = (rx1 - ox) / z
+        pdf_y1 = (ry1 - oy) / z
+        # Render that clip at current zoom resolution
+        page = self._doc[pg_idx]
+        clip = fitz.Rect(pdf_x0, pdf_y0, pdf_x1, pdf_y1)
+        mat = fitz.Matrix(z, z)
+        pix = page.get_pixmap(matrix=mat, clip=clip, alpha=False)
+        from PIL import Image as _Image
+        img = _Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+        self._clipboard_image = img
+        self._clipboard_size_pdf = (pdf_x1 - pdf_x0, pdf_y1 - pdf_y0)
+        n = len([c for c in self._clips if c.page_idx == pg_idx]) + 1
+        self._status_var.set(
+            f"Region copied ({pix.width}×{pix.height} px)  —  switch to Paste mode and click to place")
+
+    # ------------------------------------------------------------------
+    # Paste
+    # ------------------------------------------------------------------
+
+    def _paste_at(self, cx: float, cy: float) -> None:
+        """Place the clipboard image at the given canvas position."""
+        if self._clipboard_image is None:
+            self._status_var.set("Nothing in clipboard — use 'Copy region' first.")
+            return
+        hit = self._page_at_canvas(cx, cy)
+        if hit is None:
+            return
+        pg_idx, x_pdf, y_pdf = hit
+        w_pdf, h_pdf = self._clipboard_size_pdf
+        clip = RegionClip(
+            page_idx=pg_idx,
+            x_pdf=x_pdf, y_pdf=y_pdf,
+            w_pdf=w_pdf, h_pdf=h_pdf,
+            image=self._clipboard_image.copy(),
+        )
+        self._clips.append(clip)
+        self._undo_stack.append(clip)
+        self._current_page = pg_idx
+        self._refresh_controls()
+        ox, oy = self._page_offsets[pg_idx]
+        self._create_clip_widget(clip, ox, oy)
+
+    def _create_clip_widget(self, clip: RegionClip, ox: int, oy: int) -> None:
+        """Place a draggable image overlay on the canvas for a pasted RegionClip."""
+        z = self._zoom
+        cx = clip.x_pdf * z + ox
+        cy = clip.y_pdf * z + oy
+        disp_w = max(1, int(clip.w_pdf * z))
+        disp_h = max(1, int(clip.h_pdf * z))
+
+        # Resize the PIL image to current zoom for display
+        thumb = clip.image.resize((disp_w, disp_h), resample=1)
+        photo = ImageTk.PhotoImage(thumb)
+
+        frame = tk.Frame(self._canvas, bd=1, relief=tk.RIDGE, cursor="fleur")
+        lbl   = tk.Label(frame, image=photo, bd=0, cursor="fleur")
+        lbl.image = photo   # prevent GC
+        lbl.pack()
+
+        del_btn = tk.Label(frame, text="×", fg="#cc0000", bg="#f0f0f0",
+                           cursor="hand2", font=("Arial", 9, "bold"), padx=2)
+        del_btn.place(relx=1.0, rely=0.0, anchor=tk.NE)
+
+        win_id = self._canvas.create_window(cx, cy, anchor=tk.NW, window=frame,
+                                             width=disp_w + 2, height=disp_h + 2)
+        clip.canvas_win_id = win_id
+        clip.frame = frame
+        # Register the clip frame so dropping a PDF on top of it works.
+        self._register_drop_recursive(frame)
+
+        del_btn.bind("<Button-1>", lambda _e, _c=clip: self._delete_clip(_c))
+        for w in (frame, lbl):
+            w.bind("<ButtonPress-1>",  lambda e, _c=clip: self._clip_drag_start(e, _c))
+            w.bind("<B1-Motion>",      lambda e, _c=clip: self._clip_drag_move(e,  _c))
+
+    def _delete_clip(self, clip: RegionClip) -> None:
+        """Remove a pasted clip from the canvas and from the internal list."""
+        if clip.canvas_win_id:
+            self._canvas.delete(clip.canvas_win_id)
+            clip.canvas_win_id = 0
+        if clip.frame:
+            clip.frame.destroy()
+            clip.frame = None
+        try:
+            self._clips.remove(clip)
+        except ValueError:
+            pass
+        try:
+            self._undo_stack.remove(clip)
+        except ValueError:
+            pass
+
+    def _clip_drag_start(self, event: tk.Event, clip: RegionClip) -> None:
+        coords = self._canvas.coords(clip.canvas_win_id) if clip.canvas_win_id else []
+        self._clip_drag_data = {
+            "clip": clip,
+            "mouse_x": event.x_root,
+            "mouse_y": event.y_root,
+            "win_x": coords[0] if coords else clip.x_pdf * self._zoom + self._PAD,
+            "win_y": coords[1] if coords else clip.y_pdf * self._zoom + self._PAD,
+        }
+
+    def _clip_drag_move(self, event: tk.Event, clip: RegionClip) -> None:
+        dd = self._clip_drag_data
+        if not dd or dd.get("clip") is not clip:
+            return
+        new_x = dd["win_x"] + (event.x_root - dd["mouse_x"])
+        new_y = dd["win_y"] + (event.y_root - dd["mouse_y"])
+        self._canvas.coords(clip.canvas_win_id, new_x, new_y)
+        ox, oy = self._page_offsets.get(clip.page_idx, (self._PAD, self._PAD))
+        clip.x_pdf = (new_x - ox) / self._zoom
+        clip.y_pdf = (new_y - oy) / self._zoom
 
     # ------------------------------------------------------------------
     # Page operations
